@@ -30,7 +30,6 @@ func configFromFingerprint(fingerprint string, base *MetricStoreConfig) (*Metric
 	return &MetricStoreConfig{
 		Driver:              driver,
 		DSN:                 dsn,
-		RetentionDays:       base.RetentionDays,
 		DownsamplingEnabled: base.DownsamplingEnabled,
 		TablePrefix:         base.TablePrefix,
 		MaxOpenConns:        base.MaxOpenConns,
@@ -126,6 +125,9 @@ func migrateBetweenStores(ctx context.Context, src, dst *metric.Store, observe s
 		if err := dst.UpsertMetric(ctx, def); err != nil {
 			return total, fmt.Errorf("upsert metric %q on target: %w", def.Name, err)
 		}
+		if def.RetentionDays == 0 {
+			continue
+		}
 
 		earliest, latest, ok, err := metricTimeBounds(ctx, src, def.Name)
 		if err != nil {
@@ -180,7 +182,7 @@ func metricTimeBounds(ctx context.Context, src *metric.Store, name string) (time
 	wide := metric.Query{
 		MetricName: name,
 		Start:      time.Unix(0, 0),
-		End:        time.Now().Add(24 * time.Hour),
+		End:        time.Now().UTC().Add(24 * time.Hour),
 	}
 
 	asc := wide
