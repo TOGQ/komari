@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	_ "github.com/komari-monitor/komari/web/oauth/cloudflare"
 	_ "github.com/komari-monitor/komari/web/oauth/factory"
 	_ "github.com/komari-monitor/komari/web/oauth/generic"
 	_ "github.com/komari-monitor/komari/web/oauth/github"
