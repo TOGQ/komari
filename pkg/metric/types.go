@@ -143,9 +143,10 @@ type Definition struct {
 	//
 	// Unit 表示数值单位，例如 bytes 或 percent。
 	Unit string `json:"unit,omitempty"`
-	// RetentionDays controls historical data retention for this metric.
+	// RetentionDays controls historical data retention for this metric. A value
+	// of zero disables persistence and removes existing metric data.
 	//
-	// RetentionDays 控制该指标历史数据的保留天数。
+	// RetentionDays 控制该指标历史数据的保留天数；零表示禁用持久化并清除已有数据。
 	RetentionDays int `json:"retention_days,omitempty"`
 	// Metadata stores caller-defined metric metadata.
 	//
@@ -163,13 +164,10 @@ type Definition struct {
 
 // withDefaults fills default values on a metric definition.
 //
-// withDefaults 为指标定义填充默认类型和默认保留天数。
-func (d Definition) withDefaults(defaultRetentionDays int) Definition {
+// withDefaults 为指标定义填充默认类型。
+func (d Definition) withDefaults() Definition {
 	if d.Type == "" {
 		d.Type = TypeGauge
-	}
-	if d.RetentionDays == 0 {
-		d.RetentionDays = defaultRetentionDays
 	}
 	return d
 }
@@ -345,10 +343,6 @@ type AggregateQuery struct {
 	//
 	// Interval 是每个聚合桶的宽度。
 	Interval time.Duration `json:"interval"`
-	// FillEmpty emits zero-count buckets for empty intervals.
-	//
-	// FillEmpty 会为空时间段输出零计数桶。
-	FillEmpty bool `json:"fill_empty,omitempty"`
 	// PreserveSeries keeps entity/tag identities as separate aggregate series on
 	// rollup-backed reads. The default preserves the historical rollup behavior
 	// of merging all matched series into each output bucket.

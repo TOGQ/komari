@@ -27,9 +27,6 @@ func (s *Store) Compact(ctx context.Context, now time.Time) (int, error) {
 	if err := s.ensureOpen(); err != nil {
 		return 0, err
 	}
-	if !s.cfg.RollupPolicy.Enabled() {
-		return 0, nil
-	}
 	defs, err := s.ListMetrics(ctx)
 	if err != nil {
 		return 0, err
@@ -81,10 +78,9 @@ func (s *Store) CompactMetric(ctx context.Context, metricName string, now time.T
 	if err := s.ensureOpen(); err != nil {
 		return 0, err
 	}
+	s.retentionMu.RLock()
+	defer s.retentionMu.RUnlock()
 	policy := s.cfg.RollupPolicy
-	if !policy.Enabled() {
-		return 0, nil
-	}
 	def, err := s.GetMetric(ctx, metricName)
 	if errors.Is(err, ErrNotFound) {
 		return 0, nil
@@ -92,11 +88,16 @@ func (s *Store) CompactMetric(ctx context.Context, metricName string, now time.T
 	if err != nil {
 		return 0, err
 	}
-	retentionDays := def.RetentionDays
-	if retentionDays <= 0 {
-		retentionDays = s.cfg.DefaultRetentionDays
+	if def.RetentionDays == 0 {
+		_, err := s.DeleteSeries(ctx, Query{MetricName: metricName})
+		return 0, err
 	}
-	policy = policy.withMetricRetention(time.Duration(retentionDays) * 24 * time.Hour)
+	if !policy.Enabled() {
+		return 0, nil
+	}
+	effectivePolicy := policy.withMetricRetention(time.Duration(def.RetentionDays) * 24 * time.Hour)
+	obsoleteIntervals := rollupIntervalsOutsidePolicy(policy.Tiers, effectivePolicy.Tiers)
+	policy = effectivePolicy
 	now = now.UTC()
 
 	// Retry the whole compaction on a transient serialization/deadlock failure.
@@ -106,7 +107,7 @@ func (s *Store) CompactMetric(ctx context.Context, metricName string, now time.T
 	const maxAttempts = 5
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		written, err := s.compactMetricOnce(ctx, metricName, now, policy)
+		written, err := s.compactMetricOnce(ctx, metricName, now, policy, obsoleteIntervals)
 		if err == nil {
 			return written, nil
 		}
@@ -121,7 +122,7 @@ func (s *Store) CompactMetric(ctx context.Context, metricName string, now time.T
 // compactMetricOnce runs a single compaction attempt inside one transaction.
 //
 // compactMetricOnce 在单个事务内执行一次 compaction 尝试。
-func (s *Store) compactMetricOnce(ctx context.Context, metricName string, now time.Time, policy RollupPolicy) (int, error) {
+func (s *Store) compactMetricOnce(ctx context.Context, metricName string, now time.Time, policy RollupPolicy, obsoleteIntervals []time.Duration) (int, error) {
 	// Use a transaction to ensure consistency between raw scan, rollup write, and
 	// raw deletion. The isolation level is backend-specific (SERIALIZABLE on
 	// PostgreSQL/MySQL, default on SQLite) so late-arriving points cannot be
@@ -132,8 +133,14 @@ func (s *Store) compactMetricOnce(ctx context.Context, metricName string, now ti
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if err := s.deleteRollupsForIntervalsTx(ctx, metricName, obsoleteIntervals, tx); err != nil {
+		return 0, err
+	}
 	written, err := s.compactMetricWithinTx(ctx, metricName, now, policy, tx)
 	if err != nil {
+		return written, err
+	}
+	if err := s.persistCompactionWatermarkTx(ctx, metricName, policy.rawCutoff(now), tx); err != nil {
 		return written, err
 	}
 
@@ -141,6 +148,20 @@ func (s *Store) compactMetricOnce(ctx context.Context, metricName string, now ti
 		return written, err
 	}
 	return written, nil
+}
+
+func rollupIntervalsOutsidePolicy(configured, effective []RollupTier) []time.Duration {
+	active := make(map[time.Duration]struct{}, len(effective))
+	for _, tier := range effective {
+		active[tier.Interval] = struct{}{}
+	}
+	obsolete := make([]time.Duration, 0, len(configured))
+	for _, tier := range configured {
+		if _, ok := active[tier.Interval]; !ok {
+			obsolete = append(obsolete, tier.Interval)
+		}
+	}
+	return obsolete
 }
 
 // isRetryableSerializationError reports whether err is a transient
@@ -310,6 +331,27 @@ func (s *Store) enforceRetentionWithinTx(ctx context.Context, metricName string,
 		}
 	}
 	return nil
+}
+
+// deleteRollupsForIntervalsTx removes rows from resolutions that are no longer
+// part of a metric's effective retention policy.
+func (s *Store) deleteRollupsForIntervalsTx(ctx context.Context, metricName string, intervals []time.Duration, tx *sql.Tx) error {
+	if len(intervals) == 0 {
+		return nil
+	}
+	args := make([]any, 1, len(intervals)+1)
+	args[0] = metricName
+	placeholders := make([]string, len(intervals))
+	for i, interval := range intervals {
+		placeholders[i] = s.dialect.placeholder(i + 2)
+		args = append(args, interval.Nanoseconds())
+	}
+	sqlText := fmt.Sprintf(
+		`DELETE FROM %s WHERE metric_name = %s AND resolution_nano IN (%s)`,
+		s.tables.rollups, s.dialect.placeholder(1), strings.Join(placeholders, ", "),
+	)
+	_, err := tx.ExecContext(ctx, sqlText, args...)
+	return err
 }
 
 func alignRollupRetentionCutoff(cutoff time.Time, nextInterval time.Duration) time.Time {
@@ -543,101 +585,9 @@ func (s *Store) mergeRollupBucketsTx(ctx context.Context, metricName string, int
 	return len(keys), nil
 }
 
-// writeRollupBuckets upserts a set of computed buckets for one resolution.
-//
-// writeRollupBuckets 将某个分辨率下计算出的 rollup 桶批量 upsert 到数据库。
-func (s *Store) writeRollupBuckets(ctx context.Context, metricName string, interval time.Duration, buckets map[rollupKey]*rollupBucket) (int, error) {
-	return s.writeRollupBucketsWithMergePoint(ctx, metricName, interval, buckets, time.Time{})
-}
-
 // writeRollupBucketsTx upserts buckets within an existing transaction.
 func (s *Store) writeRollupBucketsTx(ctx context.Context, metricName string, interval time.Duration, buckets map[rollupKey]*rollupBucket, tx *sql.Tx) (int, error) {
 	return s.writeRollupBucketsWithMergePointTx(ctx, metricName, interval, buckets, time.Time{}, time.Time{}, nil, tx)
-}
-
-// writeRollupBucketsWithMergePoint is the internal implementation that optionally
-// merges buckets older than a cutoff point instead of replacing them.
-func (s *Store) writeRollupBucketsWithMergePoint(ctx context.Context, metricName string, interval time.Duration, buckets map[rollupKey]*rollupBucket, mergeCutoff time.Time) (int, error) {
-	if len(buckets) == 0 {
-		return 0, nil
-	}
-	keys := make([]rollupKey, 0, len(buckets))
-	for k := range buckets {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].entityID != keys[j].entityID {
-			return keys[i].entityID < keys[j].entityID
-		}
-		if keys[i].tagsHash != keys[j].tagsHash {
-			return keys[i].tagsHash < keys[j].tagsHash
-		}
-		return keys[i].bucket < keys[j].bucket
-	})
-
-	stmt := s.dialect.upsertRollupSQL(s.tables)
-	resNano := interval.Nanoseconds()
-	now := time.Now().UTC().UnixNano()
-	mergeCutoffNano := mergeCutoff.UnixNano()
-
-	run := func(ex execer) error {
-		for _, k := range keys {
-			b := buckets[k]
-			tagsJSON := b.tagsJSON
-			if tagsJSON == "" {
-				tagsJSON = "{}"
-			}
-
-			// If mergeCutoff is set and this bucket is older than the cutoff,
-			// merge with existing data instead of replacing it.
-			if !mergeCutoff.IsZero() && k.bucket < mergeCutoffNano {
-				// Read existing row if it exists
-				existing, err := s.readRollupBucket(ctx, metricName, k.entityID, k.tagsHash, interval, k.bucket)
-				if err != nil {
-					return err
-				}
-				if existing != nil {
-					// Merge the new bucket into the existing one
-					existing.mergeStored(b)
-					b = existing
-				}
-			}
-
-			// Column order must match rollupColumns in dialect_rollup.go:
-			// metric_name, entity_id, tags_hash, tags, resolution_nano, bucket_nano,
-			// count, sum, sum_sq, min_val, max_val, first_val, first_ts, last_val,
-			// last_ts, digest, created_at.
-			_, err := ex.ExecContext(ctx, stmt,
-				metricName, k.entityID, k.tagsHash, tagsJSON, resNano, k.bucket,
-				b.count, b.sum, b.sumSq, b.min, b.max,
-				b.firstVal, b.firstTS, b.lastVal, b.lastTS,
-				b.digest.Encode(), now,
-			)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	if len(keys) == 1 {
-		if err := run(s.db); err != nil {
-			return 0, err
-		}
-		return len(keys), nil
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := run(tx); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return len(keys), nil
 }
 
 // writeRollupBucketsWithMergePointTx is the transactional version that executes
@@ -722,63 +672,6 @@ func (s *Store) writeRollupBucketsWithMergePointTx(ctx context.Context, metricNa
 		written++
 	}
 	return written, nil
-}
-
-// readRollupBucket reads a single rollup bucket from storage, returning nil if
-// the bucket doesn't exist. Used to merge late-arriving data with existing rollups.
-func (s *Store) readRollupBucket(ctx context.Context, metricName, entityID, tagsHash string, interval time.Duration, bucketNano int64) (*rollupBucket, error) {
-	sqlText := fmt.Sprintf(
-		`SELECT count, sum, sum_sq, min_val, max_val, first_val, first_ts, last_val, last_ts, digest, tags
-		 FROM %s WHERE metric_name = %s AND resolution_nano = %s AND entity_id = %s
-		 AND tags_hash = %s AND bucket_nano = %s`,
-		s.tables.rollups,
-		s.dialect.placeholder(1), s.dialect.placeholder(2), s.dialect.placeholder(3),
-		s.dialect.placeholder(4), s.dialect.placeholder(5),
-	)
-	row := s.reader().QueryRowContext(ctx, sqlText, metricName, interval.Nanoseconds(), entityID, tagsHash, bucketNano)
-
-	var count int64
-	var sum, sumSq, minV, maxV, firstV, lastV float64
-	var firstTS, lastTS int64
-	var digestBlob []byte
-	var rawTags any
-
-	err := row.Scan(&count, &sum, &sumSq, &minV, &maxV, &firstV, &firstTS, &lastV, &lastTS, &digestBlob, &rawTags)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	td, err := DecodeTDigest(digestBlob)
-	if err != nil {
-		return nil, err
-	}
-	tagsJSON, err := rawTagsToJSON(rawTags)
-	if err != nil {
-		return nil, err
-	}
-
-	return &rollupBucket{
-		count: count, sum: sum, sumSq: sumSq,
-		min: minV, max: maxV,
-		firstVal: firstV, firstTS: firstTS,
-		lastVal: lastV, lastTS: lastTS,
-		digest:   td,
-		tagsHash: tagsHash,
-		tagsJSON: tagsJSON,
-	}, nil
-}
-
-// deleteRollupsBefore deletes stored rollup rows older than a cutoff.
-func (s *Store) deleteRollupsBefore(ctx context.Context, metricName string, interval time.Duration, before time.Time) error {
-	sqlText := fmt.Sprintf(
-		`DELETE FROM %s WHERE metric_name = %s AND resolution_nano = %s AND bucket_nano < %s`,
-		s.tables.rollups, s.dialect.placeholder(1), s.dialect.placeholder(2), s.dialect.placeholder(3),
-	)
-	_, err := s.db.ExecContext(ctx, sqlText, metricName, interval.Nanoseconds(), before.UTC().UnixNano())
-	return err
 }
 
 // deleteRollupsBeforeTx deletes stored rollup rows within a transaction.
