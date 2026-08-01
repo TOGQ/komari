@@ -190,6 +190,7 @@ func migrateLegacyOidcConfig(db *gorm.DB) error {
 
 	logger.InfoArgs("migration", "[>1.0.2] Merge OidcProvider table....")
 	var oldData struct {
+		OAuthProvider     string `gorm:"column:o_auth_provider"`
 		OAuthClientID     string `gorm:"column:o_auth_client_id"`
 		OAuthClientSecret string `gorm:"column:o_auth_client_secret"`
 	}
@@ -200,6 +201,10 @@ func migrateLegacyOidcConfig(db *gorm.DB) error {
 	if err := db.AutoMigrate(&models.OidcProvider{}); err != nil {
 		return err
 	}
+    providerName := strings.TrimSpace(oldData.OAuthProvider)
+	if providerName == "" {
+		providerName = "github"
+	}
 	addition, err := json.Marshal(map[string]string{
 		"client_id":     oldData.OAuthClientID,
 		"client_secret": oldData.OAuthClientSecret,
@@ -208,7 +213,7 @@ func migrateLegacyOidcConfig(db *gorm.DB) error {
 		return fmt.Errorf("marshal legacy OIDC config: %w", err)
 	}
 	if err := db.Save(&models.OidcProvider{
-		Name:     "github",
+		Name:     providerName,
 		Addition: string(addition),
 	}).Error; err != nil {
 		return err
@@ -217,7 +222,7 @@ func migrateLegacyOidcConfig(db *gorm.DB) error {
 	if err := db.AutoMigrate(&legacyModelConfig{}); err != nil {
 		return err
 	}
-	return db.Model(&legacyModelConfig{}).Where("id = 1").Update("o_auth_provider", "github").Error
+	return db.Model(&legacyModelConfig{}).Where("id = 1").Update("o_auth_provider", providerName).Error
 }
 
 func migrateLegacyMessageSenderConfig(db *gorm.DB) error {
