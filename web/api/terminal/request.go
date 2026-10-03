@@ -14,6 +14,17 @@ import (
 )
 
 func dispatchTerminalRequest(uuid, id string) bool {
+	// v1 客户端只认识扁平 terminal 消息，做回退用（1.4.3 行为）
+	if !agent_runtime.IsV2Client(uuid) {
+		conn := agent_runtime.GetConnectedClients()[uuid]
+		if conn == nil {
+			return false
+		}
+		return conn.WriteJSON(gin.H{
+			"message":    "terminal",
+			"request_id": id,
+		}) == nil
+	}
 	return agent_runtime.DispatchV2Event(uuid, v2.MethodAgentTerminal, v2.TerminalRequestParams{RequestID: id})
 }
 

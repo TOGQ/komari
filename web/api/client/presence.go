@@ -26,7 +26,8 @@ var (
 )
 
 // refreshPostPresence 管理 HTTP POST 上报者的在线/离线状态。
-func refreshPostPresence(uuid string) {
+// protocolVersion 标记上报所用协议（1 或 2），用于运行时区分客户端能力。
+func refreshPostPresence(uuid string, protocolVersion int) {
 	postPresenceMu.Lock()
 	defer postPresenceMu.Unlock()
 
@@ -43,7 +44,7 @@ func refreshPostPresence(uuid string) {
 
 	connID := time.Now().UnixNano()
 	agent_runtime.KeepAlivePresence(uuid, connID, postPresenceTTL)
-	agent_runtime.MarkV2Client(uuid)
+	agent_runtime.SetClientProtocolVersion(uuid, protocolVersion)
 	go notifier.OnlineNotification(uuid, connID)
 
 	defaultGeneration := uint64(0)
