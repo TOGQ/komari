@@ -57,6 +57,19 @@ func (m *PingTaskManager) Reload(pingTasks []models.PingTask) error {
 
 // executePingTask 执行单个PingTask
 func executePingTask(ctx context.Context, task models.PingTask) {
+	// v1 客户端只认识扁平 ping 消息，做回退用
+	var message struct {
+		TaskID  uint   `json:"ping_task_id"`
+		Message string `json:"message"`
+		Type    string `json:"ping_type"`
+		Target  string `json:"ping_target"`
+	}
+
+	message.Message = "ping"
+	message.TaskID = task.Id
+	message.Type = task.Type
+	message.Target = task.Target
+
 	for _, clientUUID := range targetPingClientUUIDs(task) {
 		select {
 		case <-ctx.Done():
@@ -66,7 +79,7 @@ func executePingTask(ctx context.Context, task models.PingTask) {
 			// Context is still active, continue.
 		}
 
-		agent_runtime.DispatchPing(clientUUID, v2.PingParams{TaskID: task.Id, Type: task.Type, Target: task.Target})
+		agent_runtime.DispatchPing(clientUUID, message, v2.PingParams{TaskID: task.Id, Type: task.Type, Target: task.Target})
 	}
 }
 

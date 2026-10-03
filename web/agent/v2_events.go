@@ -54,9 +54,14 @@ func DispatchV2Event(uuid, method string, params any) bool {
 	return true
 }
 
-func DispatchPing(uuid string, params v2.PingParams) bool {
+// DispatchPing 下发 ping 任务。v1 客户端（非 v2）走 legacy 扁平消息回退，
+// v2 客户端走 JSON-RPC；离线但支持事件队列的 v2 客户端则入队等待拉取。
+func DispatchPing(uuid string, legacy any, params v2.PingParams) bool {
 	if conn := GetConnectedClients()[uuid]; conn != nil {
-		payload := v2.Request{JSONRPC: v2.Version, Method: v2.MethodAgentPing, Params: params}
+		payload := legacy
+		if IsV2Client(uuid) {
+			payload = v2.Request{JSONRPC: v2.Version, Method: v2.MethodAgentPing, Params: params}
+		}
 		if conn.WriteJSON(payload) == nil {
 			return true
 		}

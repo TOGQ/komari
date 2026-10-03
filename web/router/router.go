@@ -73,6 +73,16 @@ func registerAgentRoutes(r *gin.Engine) {
 
 	tokenAuthorized := r.Group("/api/clients", api.RequireRole(api.RoleAdmin, api.RoleClient))
 	{
+		// v1 兼容上报（WS / REST），保留给旧版 agent。
+		tokenAuthorized.GET("/report", client.WebSocketReport)
+		tokenAuthorized.POST("/report", client.UploadReport)
+		tokenAuthorized.POST("/uploadBasicInfo", client.UploadBasicInfo)
+
+		// v1 JSON 裸接口 -> client: 命名空间（经 RPC 桥）。
+		tokenAuthorized.POST("/task/result", jsonRpc.Bind("client:taskResult", jsonRpc.WithRaw()))
+		tokenAuthorized.GET("/ping/tasks", jsonRpc.Bind("client:getPingTasks", jsonRpc.WithRaw()))
+		tokenAuthorized.POST("/ping/result", jsonRpc.Bind("client:uploadPingResult", jsonRpc.WithRaw()))
+
 		// Agent 上报统一使用 v2 JSON-RPC。
 		tokenAuthorized.GET("/v2/rpc", client.WebSocketV2RPC)
 		tokenAuthorized.POST("/v2/rpc", client.UploadV2RPC)

@@ -47,6 +47,18 @@ func MarkV2Client(uuid string) {
 	v2Clients[uuid] = struct{}{}
 }
 
+// SetClientProtocolVersion 记录客户端的上报协议版本，供 ping/exec 等下发逻辑
+// 做 v1 回退判断。version >= 2 记为 v2，否则清除 v2 标记（视为 v1）。
+func SetClientProtocolVersion(uuid string, version int) {
+	mu.Lock()
+	defer mu.Unlock()
+	if version >= 2 {
+		v2Clients[uuid] = struct{}{}
+	} else {
+		delete(v2Clients, uuid)
+	}
+}
+
 func IsV2Client(uuid string) bool {
 	mu.RLock()
 	defer mu.RUnlock()
