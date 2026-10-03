@@ -24,7 +24,9 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           frontend_ref=""
-          if [[ "$TAG" =~ ^(.+)-fix[0-9]+$ ]]; then
+          if [[ "$TAG" == "1.5.1" || "$TAG" == "1.5.1-rc1" ]]; then
+            frontend_ref="1.5.0-fix1"
+          elif [[ "$TAG" =~ ^(.+)-fix[0-9]+$ ]]; then
             frontend_ref="${BASH_REMATCH[1]}"
           fi
           echo "frontend_ref=$frontend_ref" >> "$GITHUB_OUTPUT"
@@ -121,7 +123,11 @@ jobs:
           fi
           VERSION="${{ github.event.release.tag_name }}"
           VERSION_HASH="${{ github.sha }}" # Use commit SHA for hash
-          go build -trimpath -ldflags="-s -w -X github.com/komari-monitor/komari/utils.CurrentVersion=${VERSION} -X github.com/komari-monitor/komari/utils.VersionHash=${VERSION_HASH}" -o $BINARY_NAME
+          LDFLAGS="-s -w -X github.com/komari-monitor/komari/utils.CurrentVersion=${VERSION} -X github.com/komari-monitor/komari/utils.VersionHash=${VERSION_HASH}"
+          if [ "${{ matrix.goos }}" = "linux" ]; then
+            LDFLAGS="$LDFLAGS -extldflags=-Wl,--strip-all"
+          fi
+          go build -trimpath -ldflags="$LDFLAGS" -o "$BINARY_NAME"
 
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4
