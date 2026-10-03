@@ -23,10 +23,7 @@ jobs:
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          frontend_ref=""
-          if [[ "$TAG" =~ ^(.+)-fix[0-9]+$ ]]; then
-            frontend_ref="${BASH_REMATCH[1]}"
-          fi
+          frontend_ref="1.5.0-fix1"
           echo "frontend_ref=$frontend_ref" >> "$GITHUB_OUTPUT"
 
   build-frontend:
